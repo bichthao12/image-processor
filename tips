@@ -1,0 +1,105 @@
+● 1. catch (Exception ex) quá rộng trong loadImages()
+
+  } catch (Exception ex) {   // bắt cả Error, NullPointerException, v.v.
+
+  Nếu có bug bất ngờ (NPE, OutOfMemoryError), sẽ bị nuốt vào imageErrors và trả về client như lỗi ảnh — che giấu bug thực sự.
+
+  Nên thu hẹp:
+  } catch (ImageLoadException | TransientImageLoadException ex) {
+
+  ---
+  2. rotation không có validation — tiềm ẩn NullPointerException
+
+  // GangSheetItemRequest
+  Double rotation   // không có @NotNull
+
+  Nếu client không gửi rotation, item.rotation() trả null → Math.toRadians(null) → NPE → rơi vào handleGeneralException → trả 500.
+
+  // Fix
+  @NotNull(message = "rotation is required")
+  Double rotation
+  // hoặc dùng primitive double và default 0 nếu không bắt buộc
+
+  ---
+  3. enforceLocalSizeBudget và enforceLoadedSizeBudget throw IllegalArgumentException
+
+  Client nhận response generic BAD_REQUEST không biết lỗi gì:
+
+  { "code": "FLT_06", "message": "Bad request" }
+
+  Nên throw AppException với error code rõ ràng:
+  throw new AppException(FltErrorCode.IMAGE_SIZE_EXCEEDED,
+          "Total image size exceeds limit", HttpStatus.BAD_REQUEST);
+
+  ---
+  4. validateItemForSheetCalculation trùng với Jakarta validation
+
+  GangSheetItemRequest đã có:
+  @NotBlank  String img        → validateItemForSheetCalculation kiểm tra lại img blank
+  @PositiveOrZero Double x     → kiểm tra lại x < 0
+  @Positive Double width       → kiểm tra lại width <= 0
+
+  Phần trùng nên xóa, giữ lại phần service validation chỉ check những gì annotation không cover được:
+  - Double.isFinite() — annotation không có
+  - width > maxItemSizeInch — business rule
+  - x > maxPositionInch — business rule
+  - Sheet boundary check
+
+  ---
+  5. resolveImageErrorCode + resolveImageErrorMessage — fragile khi thêm exception mới
+
+  private String resolveImageErrorCode(Exception ex) {
+      if (ex instanceof ImageNotFoundException) return ...;
+      if (ex instanceof ImageSizeExceededException) return ...;
+      // thêm exception mới → phải sửa CẢ HAI method
+  }
+
+  Nếu quên sửa một method → code và message không khớp nhau. Có thể gom vào một method:
+
+  private ImageLoadError.ErrorInfo resolveImageError(Exception ex) {
+      if (ex instanceof ImageNotFoundException)
+          return new ErrorInfo(FltErrorCode.IMAGE_NOT_FOUND);
+      if (ex instanceof ImageSizeExceededException)
+          return new ErrorInfo(FltErrorCode.IMAGE_SIZE_EXCEEDED);
+      ...
+  }
+
+  private record ErrorInfo(String code, String message) {
+      ErrorInfo(FltErrorCode ec) { this(ec.getCode(), ec.getMessage()); }
+  }
+
+  ---
+  6. AssetStorageService.loadAsset() signature misleading
+
+  public ImageAsset loadAsset(String img) throws ImageLoadException {
+      // nhưng loadFileFromUrl() có thể throw TransientImageLoadException
+      // vốn KHÔNG extends ImageLoadException
+  }
+
+  Caller chỉ catch (ImageLoadException) sẽ bỏ sót TransientImageLoadException. Fix bằng một trong hai:
+  - Đổi TransientImageLoadException extends ImageLoadException
+  - Hoặc thêm vào signature: throws ImageLoadException, TransientImageLoadException
+
+  ---
+  Tóm tắt
+
+  ┌───────────────────────────────────────────┬────────────┐
+  │                  Vấn đề                   │   Mức độ   │
+  ├───────────────────────────────────────────┼────────────┤
+  │ catch (Exception) quá rộng                │ Cao        │
+  ├───────────────────────────────────────────┼────────────┤
+  │ rotation thiếu @NotNull                   │ Cao        │
+  ├───────────────────────────────────────────┼────────────┤
+  │ Budget exception thiếu error code         │ Trung bình │
+  ├───────────────────────────────────────────┼────────────┤
+  │ Trùng lặp validation                      │ Trung bình │
+  ├───────────────────────────────────────────┼────────────┤
+  │ resolveImageError 2 method song song      │ Trung bình │
+  ├───────────────────────────────────────────┼────────────┤
+  │ TransientImageLoadException sai hierarchy │ Trung bình │
+  └───────────────────────────────────────────┴────────────┘
+
+✻ Baked for 1m 6s
+
+※ recap: Đang review và cải thiện gang sheet PDF API — đã phân tích exception handling, file structure, logging, constants, và naming. Bước tiếp theo: fix
+  các vấn đề trong exception handling theo thứ tự ưu tiên từ review.
