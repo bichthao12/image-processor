@@ -135,3 +135,179 @@
   ├─────┼────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────────┤
   │ 6   │ 🔵 Fragile             │ GangSheetPdfServiceImpl:386     │ Cache key inconsistency cho components=-1      │
   └─────┴────────────────────────┴─────────────────────────────────┴────────────────────────────────────────────────┘
+---------------------------------------------------------------------------------------------------------------
+Tổng quan
+
+  Client → Controller → GangSheetPdfServiceImpl → [Validate → Layout → Load Images → Build PDF] → Response
+
+  ---
+  1. Request vào — Controller (GangSheetController:29)
+
+  Client gửi POST /gang-sheets/pdf với body là danh sách item:
+
+  [
+    { "img": "https://...", "x": 0.5, "y": 1.0, "width": 3.0, "height": 2.0, "rotation": 45 },
+    ...
+  ]
+
+  GangSheetItemRequest — mỗi item gồm:
+
+  ┌───────────────┬──────────────────────────────────────────┬────────┐
+  │     Field     │                 Ý nghĩa                  │ Đơn vị │
+  ├───────────────┼──────────────────────────────────────────┼────────┤
+  │ img           │ URL hoặc đường dẫn ảnh                   │ -      │
+  ├───────────────┼──────────────────────────────────────────┼────────┤
+  │ x, y          │ Tọa độ góc trên-trái của item trên sheet │ inch   │
+  ├───────────────┼──────────────────────────────────────────┼────────┤
+  │ width, height │ Kích thước item                          │ inch   │
+  ├───────────────┼──────────────────────────────────────────┼────────┤
+  │ rotation      │ Góc xoay                                 │ độ     │
+  └───────────────┴──────────────────────────────────────────┴────────┘
+
+  Spring @Valid validate trước: img không được blank, các giá trị số phải hợp lệ (x/y ≥ 0, width/height > 0).
+
+  ---
+  2. generate() — Điểm vào chính (GangSheetPdfServiceImpl:99)
+
+  generate(items)
+    ├── validateInputs(items)        // Bước A
+    ├── computeLayout(items)         // Bước B
+    ├── loadImages(items)            // Bước C (async)
+    ├── enforceLoadedSizeBudget()    // Bước D
+    ├── buildPdf()                   // Bước E
+    └── return GeneratePdfResponse   // Bước F
+
+  ---
+  Bước A — Validate đầu vào (validateInputs:141)
+
+  3 lớp kiểm tra chạy tuần tự trước khi làm bất kỳ I/O nào:
+
+  A1. validateRequest — kiểm tra request-level:
+  - items không null/empty
+  - Số lượng item ≤ maxItemsPerRequest (config)
+
+  A2. validateItemsForSheetCalculation — kiểm tra từng item:
+  - Không null
+  - Tất cả giá trị geometry là finite (không phải NaN/Infinity)
+  - width, height ≤ maxItemSizeInch
+  - x, y ≤ maxPositionInch
+
+  A3. enforceLocalSizeBudget — kiểm tra tổng dung lượng file local (dedup theo URL):
+  - Gọi assetStorageService.peekLocalSize() — chỉ đọc file size, không download
+  - Tổng bytes của các ảnh local ≤ maxTotalBytesPerRequest
+  - Nếu vượt → throw AppException(IMAGE_SIZE_EXCEEDED)
+
+  ---
+  Bước B — Tính layout sheet (computeLayout:151)
+
+  Tính chiều cao sheet tự động dựa trên vị trí các item:
+
+  heightInch = max(item.y + item.height) + bottomPaddingInch
+
+  Sau đó kiểm tra không item nào vượt biên sheet:
+  - item.x + item.width ≤ sheetWidthInch (cố định từ config)
+  - item.y + item.height ≤ sheetHeightInch (vừa tính)
+
+  Kết quả: SheetLayout(widthInch, heightInch) — đây là kích thước PDF sẽ tạo.
+
+  ---
+  Bước C — Load ảnh song song (loadImages:443)
+
+  Đây là bước tốn thời gian nhất, dùng Virtual Threads để tải ảnh song song:
+
+  [URL_1] ──► VirtualThread ──► loadAsset() ──► ImageAsset
+  [URL_2] ──► VirtualThread ──► loadAsset() ──► ImageAsset   (song song)
+  [URL_3] ──► VirtualThread ──► loadAsset() ──► ImageAsset
+
+  Dedup: Nếu nhiều item dùng cùng 1 URL → chỉ tải 1 lần, dùng lại kết quả.
+
+  loadAsset() trả về ImageAsset chứa:
+  - path — đường dẫn file tạm (nếu là URL thì đã download về)
+  - width, height — kích thước pixel thực tế
+  - format — JPEG hoặc OTHER
+  - components — số kênh màu (1=Grayscale, 3=RGB, 4=CMYK, -1=unknown)
+  - sizeBytes — dung lượng file
+
+  Xử lý lỗi batch: Nếu có ảnh load thất bại:
+  - Gom tất cả lỗi lại, map từng lỗi sang ImageLoadError (kèm index item)
+  - Throw ImageBatchLoadException với toàn bộ danh sách lỗi → Client biết chính xác item nào lỗi
+
+  ---
+  Bước D — Kiểm tra dung lượng sau khi load (enforceLoadedSizeBudget:422)
+
+  Tổng sizeBytes của tất cả ảnh đã load (dedup) ≤ maxTotalBytesPerRequest. Đây là lớp guard thứ hai sau A3, để phát hiện
+  trường hợp ảnh từ URL có size lớn hơn dự kiến.
+
+  ---
+  Bước E — Build PDF (buildPdf:157)
+
+  buildPdf()
+    ├── Tạo thư mục output nếu chưa có
+    ├── Tạo PDDocument (PDFBox)
+    ├── Tạo 1 PDPage với kích thước = layout (đổi inch → point: 1 inch = 72pt)
+    └── embedItems()  ──► vòng lặp từng item
+          ├── addDpiWarningIfNeeded()     // kiểm tra DPI
+          ├── getOrCreatePdfImage()       // tạo/cache PDImageXObject
+          └── drawItemExactlyByFeLayout() // vẽ lên trang
+
+  E1. Kiểm tra DPI (addDpiWarningIfNeeded:401):
+  actualDpi = min(pixelWidth / widthInch, pixelHeight / heightInch)
+  Nếu actualDpi < warningDpi (150) → thêm warning vào response (không fail).
+
+  E2. Tạo PDF image (getOrCreatePdfImage:269):
+
+  Cache theo key = format|path#widthxheight để tránh encode cùng 1 ảnh nhiều lần.
+
+  Có 3 đường tạo ảnh:
+
+  ┌───────────────────────────────┬──────────────────────────────────────────────────────────────┐
+  │          Trường hợp           │                            Xử lý                             │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ JPEG, 1 hoặc 3 kênh           │ Fast path: nhúng raw bytes JPEG thẳng vào PDF (không decode) │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ JPEG, unknown components      │ Dùng JPEGFactory.createFromStream()                          │
+  ├───────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ JPEG CMYK (4 kênh) / ảnh khác │ Decode → resize → LosslessFactory hoặc JPEGFactory           │
+  └───────────────────────────────┴──────────────────────────────────────────────────────────────┘
+
+  Khi cần decode, tính DecodeSize:
+  - targetW = ceil(widthInch × renderDpi), giới hạn bởi kích thước gốc
+  - Nếu targetW × targetH > maxRasterPixels → scale down để tránh OOM
+
+  E3. Vẽ item (drawItemExactlyByFeLayout:214):
+
+  Hệ tọa độ PDF gốc là bottom-left, còn FE dùng top-left → cần chuyển đổi:
+
+  centerY_pdf = sheetHeight_pt - topY_pt - height_pt / 2
+
+  Quy trình vẽ dùng transform matrix:
+  1. translate(centerX, centerY) — di chuyển origin đến tâm item
+  2. rotate(angle) — xoay quanh tâm (nếu có)
+  3. drawImage từ (-w/2, -h/2) → vẽ item căn giữa tâm
+
+  E4. Lưu file:
+  doc.save(outputPath)  // gang-sheet-{uuid}.pdf
+
+  ---
+  Bước F — Response (generate:124)
+
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "fileName": "gang-sheet-550e8400....pdf",
+    "downloadUrl": "/api/gang-sheets/550e8400.../download",
+    "itemCount": 5,
+    "sheet": { "width": 22.0, "height": 15.5, "unit": "INCH" },
+    "warnings": ["Item at index 2 has low DPI. actualDpi=72.00, recommendedDpi>=150"]
+  }
+
+  Khối finally luôn gọi cleanupTempAssets() để xóa file tạm của ảnh download từ URL — kể cả khi có exception.
+
+  ---
+  Sơ đồ luồng ngoại lệ
+
+  Validate fail        → IllegalArgumentException / AppException (400)
+  Ảnh không tìm thấy  → ImageBatchLoadException chứa [ImageLoadError] (từng item)
+  Ảnh quá lớn         → AppException(IMAGE_SIZE_EXCEEDED) (400)
+  Định dạng không hỗ trợ → ImageBatchLoadException
+  Lỗi I/O khi build PDF  → ServerException(SYSTEM_ERROR) (500)
+
